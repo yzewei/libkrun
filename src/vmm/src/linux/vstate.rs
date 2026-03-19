@@ -50,12 +50,16 @@ use kvm_bindings::{
     KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_bindings::{
-    kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
-    KVM_API_VERSION, KVM_MEM_GUEST_MEMFD, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
+    kvm_userspace_memory_region, KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET,
+    KVM_SYSTEM_EVENT_SHUTDOWN,
+};
+#[cfg(all(feature = "tee", target_arch = "x86_64"))]
+use kvm_bindings::{
+    kvm_create_guest_memfd, kvm_userspace_memory_region2, KVM_MEM_GUEST_MEMFD,
 };
 #[cfg(feature = "tee")]
 use kvm_bindings::{kvm_enable_cap, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
@@ -121,6 +125,9 @@ pub enum Error {
     #[cfg(target_arch = "riscv64")]
     /// Error configuring the general purpose riscv64 registers.
     REGSConfiguration(arch::riscv64::regs::Error),
+    #[cfg(target_arch = "loongarch64")]
+    /// Error configuring the general purpose loongarch64 registers.
+    REGSConfiguration(arch::loongarch64::regs::Error),
     #[cfg(target_arch = "x86_64")]
     /// Error configuring the general purpose registers
     REGSConfiguration(arch::x86_64::regs::Error),
@@ -343,6 +350,11 @@ impl Display for Error {
                 f,
                 "Error configuring the general purpose riscv64 registers: {e:?}"
             ),
+            #[cfg(target_arch = "loongarch64")]
+            REGSConfiguration(e) => write!(
+                f,
+                "Error configuring the general purpose loongarch64 registers: {e:?}"
+            ),
             #[cfg(target_arch = "x86_64")]
             REGSConfiguration(e) => {
                 write!(f, "Error configuring the general purpose registers: {e:?}")
@@ -461,6 +473,8 @@ impl KvmContext {
         #[cfg(target_arch = "riscv64")]
         let capabilities = [Irqchip, Ioeventfd, Irqfd, UserMemory];
 
+        #[cfg(target_arch = "loongarch64")]
+        let capabilities = [Irqchip, Ioeventfd, Irqfd, UserMemory];
         // Check that all desired capabilities are supported.
         match capabilities
             .iter()
@@ -669,7 +683,6 @@ impl Vm {
     ) -> Result<()> {
         let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
         let start = region.start_addr().raw_value();
-        let end = start + region.len();
 
         // GuestMemfd is generally intended for either of two purposes:
         // * sharing the memory with out-of-process components, and conversely,
@@ -681,7 +694,8 @@ impl Vm {
         // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
         // general is unstable for now, so don't try to use it without a reason.
 
-        if cfg!(not(feature = "tee")) {
+        #[cfg(not(feature = "tee"))]
+        {
             let memory_region = kvm_userspace_memory_region {
                 slot: self.next_mem_slot,
                 guest_phys_addr: start,
@@ -697,7 +711,12 @@ impl Vm {
                     .set_user_memory_region(memory_region)
                     .map_err(Error::SetUserMemoryRegion)?;
             };
-        } else {
+        }
+
+        #[cfg(all(feature = "tee", target_arch = "x86_64"))]
+        {
+            let end = start + region.len();
+
             if !self.fd.check_extension(GuestMemfd) {
                 return Err(Error::KvmCap(GuestMemfd));
             }
@@ -744,6 +763,11 @@ impl Vm {
                 .map_err(Error::SetMemoryAttributes)?;
 
             self.guest_memfds.push((Range { start, end }, guest_memfd));
+        }
+
+        #[cfg(all(feature = "tee", not(target_arch = "x86_64")))]
+        {
+            return Err(Error::InvalidTee);
         }
 
         self.next_mem_slot += 1;
@@ -1137,6 +1161,25 @@ impl Vcpu {
         })
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    pub fn new_loongarch64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+        let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
+        let (event_sender, event_receiver) = unbounded();
+        let (response_sender, response_receiver) = unbounded();
+
+        Ok(Vcpu {
+            fd: kvm_vcpu,
+            id,
+            mmio_bus: None,
+            exit_evt,
+            event_receiver,
+            event_sender: Some(event_sender),
+            response_receiver: Some(response_receiver),
+            response_sender,
+        })
+    }
+
+
     /// Returns the cpu index as seen by the guest OS.
     pub fn cpu_index(&self) -> u8 {
         self.id
@@ -1265,6 +1308,20 @@ impl Vcpu {
             .map_err(Error::REGSConfiguration)?;
         Ok(())
     }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn configure_loongarch64(
+        &mut self,
+        _vm_fd: &VmFd,
+        kernel_load_addr: GuestAddress,
+        cmdline_addr: GuestAddress,
+        efi_system_table_addr: GuestAddress,
+    ) -> Result<()> {
+        arch::loongarch64::regs::setup_regs(&self.fd, kernel_load_addr.raw_value(), cmdline_addr.raw_value(), true, efi_system_table_addr.raw_value())
+            .map_err(Error::REGSConfiguration)?;
+        Ok(())
+    }
+
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
@@ -1503,6 +1560,40 @@ impl Vcpu {
                         mmio_bus.write(0, addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
+                }
+                #[cfg(target_arch = "loongarch64")]
+                VcpuExit::IocsrRead(addr, data) => {
+                    match (addr, data.len()) {
+                        (0x8, 4) => {
+                            const IOCSRF_EXTIOI: u32 = 1 << 3;
+                            const IOCSRF_CSRIPI: u32 = 1 << 4;
+                            const IOCSRF_VM: u32 = 1 << 11;
+
+                            let features = IOCSRF_EXTIOI | IOCSRF_CSRIPI | IOCSRF_VM;
+                            data.copy_from_slice(&features.to_le_bytes());
+                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
+                            Ok(VcpuEmulation::Handled)
+                        }
+                        (0x10, 8) => {
+                            data.copy_from_slice(b"Loongson");
+                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
+                            Ok(VcpuEmulation::Handled)
+                        }
+                        (0x20, 8) => {
+                            data.copy_from_slice(b"KVMGuest");
+                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
+                            Ok(VcpuEmulation::Handled)
+                        }
+                        _ => {
+                            error!("Unhandled LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
+                            Err(Error::VcpuUnhandledKvmExit)
+                        }
+                    }
+                }
+                #[cfg(target_arch = "loongarch64")]
+                VcpuExit::IocsrWrite(addr, data) => {
+                    error!("Unhandled LoongArch IOCSR write: addr=0x{addr:x}, data={:x?}", data);
+                    Err(Error::VcpuUnhandledKvmExit)
                 }
                 VcpuExit::Hlt => {
                     info!("Received KVM_EXIT_HLT signal");

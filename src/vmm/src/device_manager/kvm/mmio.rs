@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
 use devices::fdt::DeviceInfoForFDT;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
@@ -183,7 +183,7 @@ impl MMIODeviceManager {
             .map_err(Error::Cmdline)
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
         &mut self,
@@ -216,6 +216,9 @@ impl MMIODeviceManager {
                 &format!("pl011,mmio32,0x{:08x}", self.mmio_base),
                 #[cfg(target_arch = "riscv64")]
                 &format!("uart,mmio,0x{:08x}", self.mmio_base),
+                #[cfg(target_arch = "loongarch64")]
+                &format!("uart8250,mmio,0x{:08x}", self.mmio_base),
+
             )
             .map_err(Error::Cmdline)?;
 
@@ -268,7 +271,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
@@ -300,7 +303,7 @@ pub struct MMIODeviceInfo {
     _len: u64,
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
 impl DeviceInfoForFDT for MMIODeviceInfo {
     fn addr(&self) -> u64 {
         self.addr
