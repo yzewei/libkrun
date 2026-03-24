@@ -96,7 +96,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             );
         }
-        debug!("opcode: {}", in_header.opcode);
+        // debug!("opcode: {}", in_header.opcode);
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -846,7 +846,6 @@ impl<F: FileSystem + Sync> Server<F> {
             max_readahead,
             flags,
         } = r.read_obj().map_err(Error::DecodeMessage)?;
-
         let options = FsOptions::from_bits_truncate(flags as u64);
 
         let InitInExt { flags2, .. } = if options.contains(FsOptions::INIT_EXT) {
@@ -854,6 +853,11 @@ impl<F: FileSystem + Sync> Server<F> {
         } else {
             InitInExt::default()
         };
+
+        debug!(
+            "FUSE_INIT request: major={}, minor={}, flags=0x{:x}, flags2=0x{:x}",
+            major, minor, flags, flags2
+        );
 
         if major < KERNEL_VERSION {
             error!("Unsupported fuse protocol version: {major}.{minor}");
@@ -911,6 +915,10 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.init(capable) {
             Ok(want) => {
                 let enabled = (capable & (want | supported)).bits();
+                debug!(
+                    "FUSE_INIT ok: want=0x{:x}, enabled=0x{:x}, max_pages={}",
+                    want.bits(), enabled, max_pages
+                );
                 self.options.store(enabled, Ordering::Relaxed);
 
                 let out = InitOut {
@@ -930,7 +938,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
                 reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => {
+                error!("FUSE_INIT fs.init failed: {}", e);
+                reply_error(e, in_header.unique, w)
+            }
         }
     }
 

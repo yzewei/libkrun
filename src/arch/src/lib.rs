@@ -55,7 +55,6 @@ pub use loongarch64::{
     layout::IRQ_MAX, layout::RESET_VECTOR, Error, MMIO_MEM_START,
 };
 
-
 /// Module for x86_64 related functionality.
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

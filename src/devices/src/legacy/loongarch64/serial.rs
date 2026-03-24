@@ -18,9 +18,9 @@ use crate::legacy::{IrqChip, ReadableFd};
 const LOOP_SIZE: usize = 0x40;
 
 const DATA: u8 = 0; // data reg
-const IER: u8 = 1;  // interrupt enable reg
-const IIR: u8 = 2;  // interrupt indentify reg
-const LCR: u8 = 3;  // line control reg
+const IER: u8 = 1; // interrupt enable reg
+const IIR: u8 = 2; // interrupt indentify reg
+const LCR: u8 = 3; // line control reg
 const MCR: u8 = 4;
 const LSR: u8 = 5;
 const MSR: u8 = 6;
@@ -70,6 +70,8 @@ pub struct Serial {
     in_buffer: VecDeque<u8>,
     out: Option<Box<dyn io::Write + Send>>,
     input: Option<Box<dyn ReadableFd + Send>>,
+    intc: Option<IrqChip>,
+    irq_line: Option<u32>,
 }
 
 impl Serial {
@@ -91,6 +93,8 @@ impl Serial {
             in_buffer: VecDeque::new(),
             out,
             input,
+            intc: None,
+            irq_line: None,
         }
     }
 
@@ -113,8 +117,14 @@ impl Serial {
         Self::new(interrupt_evt, None, None)
     }
 
-    pub fn set_intc(&mut self, _intc: IrqChip) {}
-    
+    pub fn set_intc(&mut self, intc: IrqChip) {
+        self.intc = Some(intc);
+    }
+
+    pub fn set_irq_line(&mut self, irq: u32) {
+        self.irq_line = Some(irq);
+    }
+
     /// Provides a reference to the interrupt event fd.
     pub fn interrupt_evt(&self) -> &EventFd {
         &self.interrupt_evt
@@ -141,17 +151,38 @@ impl Serial {
         self.interrupt_identification |= bit;
     }
 
-    fn del_intr_bit(&mut self, bit: u8) {
+    fn interrupt_active(&self) -> bool {
+        (self.interrupt_identification & IIR_NONE_BIT) == 0
+    }
+
+    fn sync_interrupt(&mut self) -> io::Result<()> {
+        if let Some(intc) = &self.intc {
+            intc.lock()
+                .unwrap()
+                .set_irq_state(self.irq_line, Some(&self.interrupt_evt), self.interrupt_active())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+            return Ok(());
+        }
+
+        if self.interrupt_active() {
+            self.interrupt_evt.write(1)?;
+        }
+
+        Ok(())
+    }
+
+    fn del_intr_bit(&mut self, bit: u8) -> io::Result<()> {
         self.interrupt_identification &= !bit;
         if self.interrupt_identification == 0x0 {
             self.interrupt_identification = IIR_NONE_BIT;
         }
+        self.sync_interrupt()
     }
 
     fn thr_empty(&mut self) -> io::Result<()> {
         if self.is_thr_intr_enabled() {
             self.add_intr_bit(IIR_THR_BIT);
-            self.trigger_interrupt()?
+            self.sync_interrupt()?
         }
         Ok(())
     }
@@ -159,18 +190,15 @@ impl Serial {
     fn recv_data(&mut self) -> io::Result<()> {
         if self.is_recv_intr_enabled() {
             self.add_intr_bit(IIR_RECV_BIT);
-            self.trigger_interrupt()?
+            self.sync_interrupt()?
         }
         self.line_status |= LSR_DATA_BIT;
         Ok(())
     }
 
-    fn trigger_interrupt(&mut self) -> io::Result<()> {
-        self.interrupt_evt.write(1)
-    }
-
-    fn iir_reset(&mut self) {
+    fn iir_reset(&mut self) -> io::Result<()> {
         self.interrupt_identification = DEFAULT_INTERRUPT_IDENTIFICATION;
+        self.sync_interrupt()
     }
 
     // Handles a write request from the driver.
@@ -196,7 +224,10 @@ impl Serial {
                     self.thr_empty()?;
                 }
             }
-            IER => self.interrupt_enable = value & IER_FIFO_BITS,
+            IER => {
+                self.interrupt_enable = value & IER_FIFO_BITS;
+                self.sync_interrupt()?;
+            }
             LCR => self.line_control = value,
             MCR => self.modem_control = value,
             SCR => self.scratch = value,
@@ -211,7 +242,7 @@ impl Serial {
             DLAB_LOW if self.is_dlab_set() => self.baud_divisor as u8,
             DLAB_HIGH if self.is_dlab_set() => (self.baud_divisor >> 8) as u8,
             DATA => {
-                self.del_intr_bit(IIR_RECV_BIT);
+                self.del_intr_bit(IIR_RECV_BIT).ok();
                 if self.in_buffer.len() <= 1 {
                     self.line_status &= !LSR_DATA_BIT;
                 }
@@ -220,7 +251,7 @@ impl Serial {
             IER => self.interrupt_enable,
             IIR => {
                 let v = self.interrupt_identification | IIR_FIFO_BITS;
-                self.iir_reset();
+                self.iir_reset().ok();
                 v
             }
             LCR => self.line_control,

@@ -7,12 +7,21 @@
 
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
+#[cfg(target_arch = "loongarch64")]
+use arch::loongarch64::linux::iocsr::{LoongArchIocsrState, process_iocsr_read, process_iocsr_write};
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
+#[cfg(target_arch = "loongarch64")]
+use std::fs::File;
 use std::io;
 use std::ops::Range;
+
+#[cfg(target_arch = "loongarch64")]
+use std::sync::Arc;
+#[cfg(target_arch = "loongarch64")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use std::os::unix::io::RawFd;
 
@@ -170,6 +179,8 @@ pub enum Error {
     VcpuCountNotInitialized,
     /// Cannot open the VCPU file descriptor.
     VcpuFd(kvm_ioctls::Error),
+    /// Cannot clone the VCPU file descriptor.
+    VcpuFdClone(io::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu debug regs.
     VcpuGetDebugRegs(kvm_ioctls::Error),
@@ -291,6 +302,7 @@ impl Display for Error {
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
             VmFd(e) => write!(f, "Cannot open the VM file descriptor: {e}"),
             VcpuFd(e) => write!(f, "Cannot open the VCPU file descriptor: {e}"),
+            VcpuFdClone(e) => write!(f, "Cannot clone the VCPU file descriptor: {e}"),
             VmSetup(e) => write!(f, "Cannot configure the microvm: {e}"),
             VmSplitIrqchip(e) => write!(f, "Failed to enable split IRQCHIP: {e}"),
             VmApicBusClockRate(e) => write!(
@@ -973,6 +985,8 @@ pub struct Vcpu {
 
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
+    #[cfg(target_arch = "loongarch64")]
+    iocsr_state: Arc<LoongArchIocsrState>,
 }
 
 impl Vcpu {
@@ -1162,7 +1176,7 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    pub fn new_loongarch64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+    pub fn new_loongarch64(id: u8, vm_fd: &VmFd, exit_evt: EventFd, iocsr_state: Arc<LoongArchIocsrState>) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1176,7 +1190,18 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            iocsr_state,
         })
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn try_clone_irq_vcpu_file(&self) -> Result<File> {
+        let vcpufd = unsafe { libc::dup(self.fd.as_raw_fd()) };
+        if vcpufd < 0 {
+            return Err(Error::VcpuFdClone(io::Error::last_os_error()));
+        }
+
+        Ok(unsafe { File::from_raw_fd(vcpufd) })
     }
 
 
@@ -1550,12 +1575,16 @@ impl Vcpu {
                     }
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    //#[cfg(target_arch = "loongarch64")]
+                    //debug!("loongarch serial mmio read: addr=0x{addr:x}, len={}", data.len());
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.read(0, addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    //#[cfg(target_arch = "loongarch64")]
+                    //debug!("loongarch serial mmio write: addr=0x{addr:x}, data={:x?}", data);
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(0, addr, data);
                     }
@@ -1563,28 +1592,12 @@ impl Vcpu {
                 }
                 #[cfg(target_arch = "loongarch64")]
                 VcpuExit::IocsrRead(addr, data) => {
-                    match (addr, data.len()) {
-                        (0x8, 4) => {
-                            const IOCSRF_EXTIOI: u32 = 1 << 3;
-                            const IOCSRF_CSRIPI: u32 = 1 << 4;
-                            const IOCSRF_VM: u32 = 1 << 11;
-
-                            let features = IOCSRF_EXTIOI | IOCSRF_CSRIPI | IOCSRF_VM;
-                            data.copy_from_slice(&features.to_le_bytes());
-                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
+                    match process_iocsr_read(addr, data, &self.iocsr_state.clone(), self.id) {
+                        arch::loongarch64::linux::iocsr::IocsrReadResult::Value(value) => {
+                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}, value=0x{value:x}", data.len());
                             Ok(VcpuEmulation::Handled)
                         }
-                        (0x10, 8) => {
-                            data.copy_from_slice(b"Loongson");
-                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
-                            Ok(VcpuEmulation::Handled)
-                        }
-                        (0x20, 8) => {
-                            data.copy_from_slice(b"KVMGuest");
-                            debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
-                            Ok(VcpuEmulation::Handled)
-                        }
-                        _ => {
+                        arch::loongarch64::linux::iocsr::IocsrReadResult::Unhandled => {
                             error!("Unhandled LoongArch IOCSR read: addr=0x{addr:x}, len={}", data.len());
                             Err(Error::VcpuUnhandledKvmExit)
                         }
@@ -1592,8 +1605,17 @@ impl Vcpu {
                 }
                 #[cfg(target_arch = "loongarch64")]
                 VcpuExit::IocsrWrite(addr, data) => {
-                    error!("Unhandled LoongArch IOCSR write: addr=0x{addr:x}, data={:x?}", data);
-                    Err(Error::VcpuUnhandledKvmExit)
+                    match process_iocsr_write(addr, data, &self.iocsr_state.clone(), self.id) {
+                        arch::loongarch64::linux::iocsr::IocsrWriteResult::Handled => {
+                            let value = u64::from_le_bytes(data.try_into().unwrap());
+                            debug!("LoongArch IOCSR write: addr=0x{addr:x}, value=0x{value:x}");
+                            Ok(VcpuEmulation::Handled)
+                        }
+                        arch::loongarch64::linux::iocsr::IocsrWriteResult::Unhandled => {
+                            error!("Unhandled LoongArch IOCSR write: addr=0x{addr:x}, len={}", data.len());
+                            Err(Error::VcpuUnhandledKvmExit)
+                        }
+                    }
                 }
                 VcpuExit::Hlt => {
                     info!("Received KVM_EXIT_HLT signal");

@@ -9,9 +9,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
 use devices::fdt::DeviceInfoForFDT;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
@@ -89,7 +97,7 @@ pub struct MMIODeviceManager {
 impl MMIODeviceManager {
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
-        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
+        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")) {
             *mmio_base += MMIO_LEN;
         }
         MMIODeviceManager {
@@ -139,6 +147,7 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
+        #[cfg(not(target_arch = "loongarch64"))]
         vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
             .map_err(Error::RegisterIrqFd)?;
 
@@ -183,11 +192,15 @@ impl MMIODeviceManager {
             .map_err(Error::Cmdline)
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    ))]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
         &mut self,
-        vm: &VmFd,
+        _vm: &VmFd,
         cmdline: &mut kernel_cmdline::Cmdline,
         intc: IrqChip,
         serial: Arc<Mutex<devices::legacy::Serial>>,
@@ -196,7 +209,8 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
+        #[cfg(not(target_arch = "loongarch64"))]
+        _vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
             .map_err(Error::RegisterIrqFd)?;
 
         {
@@ -218,7 +232,6 @@ impl MMIODeviceManager {
                 &format!("uart,mmio,0x{:08x}", self.mmio_base),
                 #[cfg(target_arch = "loongarch64")]
                 &format!("uart8250,mmio,0x{:08x}", self.mmio_base),
-
             )
             .map_err(Error::Cmdline)?;
 
@@ -271,7 +284,11 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    ))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
@@ -303,7 +320,11 @@ pub struct MMIODeviceInfo {
     _len: u64,
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
 impl DeviceInfoForFDT for MMIODeviceInfo {
     fn addr(&self) -> u64 {
         self.addr

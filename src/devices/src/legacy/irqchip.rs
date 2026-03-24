@@ -35,6 +35,16 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn set_irq_state(
+        &self,
+        irq_line: Option<u32>,
+        interrupt_evt: Option<&EventFd>,
+        active: bool,
+    ) -> Result<(), DeviceError> {
+        self.inner.set_irq_state(irq_line, interrupt_evt, active)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -154,6 +164,18 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+    fn set_irq_state(
+        &self,
+        irq_line: Option<u32>,
+        interrupt_evt: Option<&EventFd>,
+        active: bool,
+    ) -> Result<(), DeviceError> {
+        if active {
+            self.set_irq(irq_line, interrupt_evt)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test_utils"))]

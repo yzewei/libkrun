@@ -13,11 +13,12 @@ pub const CMDLINE_MAX_SIZE: usize = 2048;
 /// Kernel command line args size
 pub const CMDLINE_GUEST_SIZE: u64 = 0x4000;
 
-/// First usable interrupt on LoongArch.
-pub const IRQ_BASE: u32 = 0;
-
-/// Last usable interrupt on LoongArch.
-pub const IRQ_MAX: u32 = 1023;
+/// Usable CPU hardware interrupt range on LoongArch.
+///
+/// The current virt platform injects serial/virtio interrupts through
+/// `cpuintc + KVM_INTERRUPT`, so keep the MMIO allocator inside INT_HWI0..7.
+pub const IRQ_BASE: u32 = 2;
+pub const IRQ_MAX: u32 = 9;
 
 /// Below this address will reside MMIO devices.
 pub const MAPPED_IO_START: u64 = 0x0a00_0000;

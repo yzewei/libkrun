@@ -1,8 +1,8 @@
-use std::result;
-use log::debug;
-use std::arch::asm;
 use kvm_bindings::{KVM_REG_LOONGARCH, KVM_REG_SIZE_U64, LOONGARCH_REG_SHIFT};
 use kvm_ioctls::VcpuFd;
+use log::debug;
+use std::arch::asm;
+use std::result;
 const KVM_REG_LOONGARCH_CPUCFG: u64 = (KVM_REG_LOONGARCH as u64) | 0x40000;
 const CPUCFG0_REG_ID: u64 =
     KVM_REG_LOONGARCH_CPUCFG | KVM_REG_SIZE_U64 | (0_u64 << LOONGARCH_REG_SHIFT);
@@ -23,6 +23,12 @@ const CPUCFG3_KVM_MASK: u64 = (1u64 << 17) - 1;
 const CPUCFG4_KVM_MASK: u64 = 0xffff_ffff;
 const CPUCFG5_KVM_MASK: u64 = 0xffff_ffff;
 
+const CPUCFG16_CACHE_CONFIG: u64 = 0xF;  // L1I, L1D, L2, L3 present
+const CPUCFG17_L1I_MASK: u64 = ((5u64) << 24) | ((8u64) << 16) | ((4u64 - 1) << 0);
+const CPUCFG18_L1D_MASK: u64 = ((5u64) << 24) | ((8u64) << 16) | ((4u64 - 1) << 0);
+const CPUCFG19_L2_MASK: u64 = ((6u64) << 24) | ((9u64) << 16) | ((8u64 - 1) << 0);
+const CPUCFG20_L3_MASK: u64 = ((6u64) << 24) | ((10u64) << 16) | ((16u64 - 1) << 0);
+
 #[derive(Debug)]
 pub enum Error {
     GetCoreRegs(kvm_ioctls::Error),
@@ -32,7 +38,13 @@ pub enum Error {
 
 type Result<T> = result::Result<T, Error>;
 
-pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64, cmdline_addr: u64, efi_boot: bool, system_table: u64) -> Result<()> {
+pub fn setup_regs(
+    vcpu: &VcpuFd,
+    boot_ip: u64,
+    cmdline_addr: u64,
+    efi_boot: bool,
+    system_table: u64,
+) -> Result<()> {
     setup_cpucfg(vcpu)?;
     let mut regs = vcpu.get_regs().map_err(Error::GetCoreRegs)?;
     regs.pc = boot_ip;
@@ -42,10 +54,7 @@ pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64, cmdline_addr: u64, efi_boot: bool
 
     debug!(
         "loongarch setup_regs: pc=0x{:x}, a0={}, a1=0x{:x}, a2=0x{:x}",
-        regs.pc,
-        regs.gpr[4],
-        regs.gpr[5],
-        regs.gpr[6],
+        regs.pc, regs.gpr[4], regs.gpr[5], regs.gpr[6],
     );
     let mut cpucfg0 = [0_u8; 8];
     if vcpu.get_one_reg(CPUCFG0_REG_ID, &mut cpucfg0).is_ok() {
@@ -106,6 +115,7 @@ fn filter_cpucfg_for_kvm(index: u64, host_value: u64) -> u64 {
 }
 
 fn setup_cpucfg(vcpu: &VcpuFd) -> Result<()> {
+    // Setup CPUCFG 0-5: Basic CPU information
     for index in 0..=5u64 {
         let host_value = read_host_cpucfg(index);
         let guest_value = filter_cpucfg_for_kvm(index, host_value);
@@ -115,11 +125,32 @@ fn setup_cpucfg(vcpu: &VcpuFd) -> Result<()> {
 
         debug!(
             "loongarch set cpucfg{}: host=0x{:x}, guest=0x{:x}",
-            index,
-            host_value,
-            guest_value,
+            index, host_value, guest_value,
         );
     }
+
+    // Setup CPUCFG 16-20: Cache configuration
+    // CPUCFG16: Cache configuration (which cache levels exist)
+    // Format: L1I present | L1D present | L2 present | L3 present
+    let cpucfg16 = CPUCFG16_CACHE_CONFIG;
+    vcpu.set_one_reg(cpucfg_reg_id(16), &cpucfg16.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+    debug!("loongarch set cpucfg16: 0x{:x}", cpucfg16);
+    // CPUCFG17-20: Cache properties for each level
+    // Format: ways[13:8] | sets[21:16] | linesz[15:12] | other[11:0]
+    // We'll use common values for a typical Loongson 3A5000-like CPU
+    vcpu.set_one_reg(cpucfg_reg_id(17), &CPUCFG17_L1I_MASK.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+    vcpu.set_one_reg(cpucfg_reg_id(18), &CPUCFG18_L1D_MASK.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+    vcpu.set_one_reg(cpucfg_reg_id(19), &CPUCFG19_L2_MASK.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+    vcpu.set_one_reg(cpucfg_reg_id(20), &CPUCFG20_L3_MASK.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+    debug!(
+        "loongarch set cpucfg17-20: 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}",
+        CPUCFG17_L1I_MASK, CPUCFG18_L1D_MASK, CPUCFG19_L2_MASK, CPUCFG20_L3_MASK
+    );
 
     Ok(())
 }

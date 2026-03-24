@@ -917,14 +917,23 @@ impl FileSystem for PassthroughFs {
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
+        debug!("virtiofs passthrough init: root_dir={}", self.cfg.root_dir);
+
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            error!("virtiofs passthrough init openat failed: root_dir={}, err={}", self.cfg.root_dir, e);
+            return Err(e);
         }
 
         // Safe because we just opened this fd above.
         let f = unsafe { File::from_raw_fd(fd) };
 
         let (st, mnt_id) = statx(&f)?;
+
+        debug!(
+            "virtiofs passthrough init ok: root_dir={}, ino={}, dev={}, mnt_id={}",
+            self.cfg.root_dir, st.st_ino, st.st_dev, mnt_id
+        );
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because

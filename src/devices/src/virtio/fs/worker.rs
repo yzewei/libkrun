@@ -124,7 +124,7 @@ impl FsWorker {
     }
 
     fn handle_event(&mut self, queue_index: usize) {
-        debug!("Fs: queue event: {queue_index}");
+        // debug!("Fs: queue event: {queue_index}");
         if let Err(e) = self.queue_evts[queue_index].read() {
             error!("Failed to get queue event: {e:?}");
         }
@@ -155,16 +155,32 @@ impl FsWorker {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
-                reader,
-                writer,
-                &self.shm_region,
-                &self.exit_code,
+            let _written = match self.server.handle_message(
+                 reader,
+                 writer,
+                 &self.shm_region,
+                 &self.exit_code,
                 #[cfg(target_os = "macos")]
-                &self.map_sender,
-            ) {
-                error!("error handling message: {e:?}");
-            }
+                &self.map_sender,) {
+                Ok(n) => {
+                    // debug!("virtiofs reply bytes_written={}", n);
+                    n as u32
+                }
+                Err(e) => {
+                    error!("error handling message: {e:?}");
+                    0
+                }
+            };
+            // if let Err(e) = self.server.handle_message(
+            //     reader,
+            //     writer,
+            //     &self.shm_region,
+            //     &self.exit_code,
+            //     #[cfg(target_os = "macos")]
+            //     &self.map_sender,
+            // ) {
+            //     error!("error handling message: {e:?}");
+            // }
 
             if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
                 error!("failed to add used elements to the queue: {e:?}");

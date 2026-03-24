@@ -1,22 +1,31 @@
+use std::fs::File;
 use std::io;
 
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChipT;
 use crate::Error as DeviceError;
 
+use kvm_bindings::kvm_interrupt;
 use kvm_ioctls::{DeviceFd, VmFd};
 use utils::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_ref;
+use vmm_sys_util::ioctl_iow_nr;
+
+ioctl_iow_nr!(KVM_INTERRUPT_LOONGARCH, kvm_bindings::KVMIO, 0x86, kvm_interrupt);
 
 pub struct KvmLoongArchIrqChip {
     _ipi_fd: DeviceFd,
     _eiointc_fd: DeviceFd,
     _pchpic_fd: DeviceFd,
-
-    vcpu_count: u32,
+    irq_vcpu_fd: File,
+    _vcpu_count: u32,
 }
 
 impl KvmLoongArchIrqChip {
-    pub fn new(vm: &VmFd, vcpu_count: u32) ->Result<Self, DeviceError> {
+    pub fn new(vm: &VmFd, vcpu_count: u32, irq_vcpu_fd: File) -> Result<Self, DeviceError> {
+        // Keep the in-kernel external irqchip devices around for platform
+        // compatibility; the active serial/virtio injection path uses
+        // KVM_INTERRUPT through cpuintc on vcpu0.
         let mut ipi_device = kvm_bindings::kvm_create_device {
             type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_LOONGARCH_IPI,
             fd: 0,
@@ -70,7 +79,8 @@ impl KvmLoongArchIrqChip {
             _ipi_fd: ipi_fd,
             _eiointc_fd: eiointc_fd,
             _pchpic_fd: pchpic_fd,
-            vcpu_count,
+            irq_vcpu_fd,
+            _vcpu_count: vcpu_count,
         })
     }
 }
@@ -84,12 +94,18 @@ impl IrqChipT for KvmLoongArchIrqChip {
         0x400
     }
 
-    fn set_irq(&self, _irq_line: Option<u32>, interrupt_evt: Option<&EventFd> ) -> Result<(), DeviceError> {
+    fn set_irq(
+        &self,
+        _irq_line: Option<u32>,
+        interrupt_evt: Option<&EventFd>,
+    ) -> Result<(), DeviceError> {
+        //debug!("loongarch irqchip set_irq irq_line={:?}", _irq_line);
         if let Some(interrupt_evt) = interrupt_evt {
             if let Err(e) = interrupt_evt.write(1) {
                 error!("Failed to signal used queue: {e:?}");
                 return Err(DeviceError::FailedSignalingUsedQueue(e));
             }
+            //debug!("loongarch irqchip eventfd write ok");
         } else {
             error!("EventFd not set up for irq line");
             return Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
@@ -100,6 +116,50 @@ impl IrqChipT for KvmLoongArchIrqChip {
         Ok(())
     }
 
+    fn set_irq_state(
+        &self,
+        irq_line: Option<u32>,
+        _interrupt_evt: Option<&EventFd>,
+        active: bool,
+    ) -> Result<(), DeviceError> {
+        let irq = match irq_line {
+            Some(irq) => irq,
+            None => {
+                return Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "irq_line not set",
+                )));
+            }
+        };
+
+        let signed_irq = if active {
+            irq as i32
+        } else {
+            -(irq as i32)
+        };
+        let interrupt = kvm_interrupt {
+            // KVM uapi exposes `irq` as u32, but LoongArch KVM casts it back to `int`
+            // and uses the sign to distinguish assert vs deassert.
+            irq: signed_irq as u32,
+        };
+
+        let ret =
+            unsafe { ioctl_with_ref(&self.irq_vcpu_fd, KVM_INTERRUPT_LOONGARCH(), &interrupt) };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            error!(
+                "KVM_INTERRUPT failed: irq={}, signed_irq={}, active={}, err={e:?}",
+                irq, signed_irq, active
+            );
+            return Err(DeviceError::FailedSignalingUsedQueue(e));
+        }
+
+        // debug!(
+        //     "KVM_INTERRUPT ok: irq={}, signed_irq={}, active={}",
+        //     irq, signed_irq, active
+        // );
+        Ok(())
+    }
 }
 
 impl BusDevice for KvmLoongArchIrqChip {

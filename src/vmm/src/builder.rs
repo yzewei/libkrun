@@ -969,10 +969,19 @@ pub fn build_microvm(
         )
         .map_err(StartMicrovmError::Internal)?;
 
+        let irq_vcpu_fd = vcpus
+            .first()
+            .ok_or_else(|| {
+                StartMicrovmError::Internal(Error::Vcpu(VstateError::VcpuCountNotInitialized))
+            })?
+            .try_clone_irq_vcpu_file()
+            .map_err(|e| StartMicrovmError::Internal(Error::Vcpu(e)))?;
+
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
             KvmLoongArchIrqChip::new(
                 vm.fd(),
                 vm_resources.vm_config().vcpu_count.unwrap() as u32,
+                irq_vcpu_fd,
             )
             .unwrap(),
         ))));
@@ -1246,7 +1255,8 @@ fn load_external_kernel(
             const LOONGARCH_VMLINUX_LOAD_ADDRESS: u64 = 0x9000_0000_0020_0000;
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::PeGzOpenKernel)?;
-            if let Some(magic) = data
+
+            let kernel_data = if let Some(magic) = data
                 .windows(3)
                 .position(|window| window == [0x1f, 0x8b, 0x8])
             {
@@ -1256,65 +1266,67 @@ fn load_external_kernel(
                 let mut kernel_data: Vec<u8> = Vec::new();
                 gz.read_to_end(&mut kernel_data)
                     .map_err(StartMicrovmError::PeGzDecoder)?;
-
-                if kernel_data.len() < LOONGARCH_IMAGE_HEADER_SIZE {
-                    return Err(StartMicrovmError::PeGzInvalid);
-                }
-
-                let pe_magic = u32::from_le_bytes(
-                    kernel_data[LOONGARCH_LINUX_PE_MAGIC_OFFSET..LOONGARCH_LINUX_PE_MAGIC_OFFSET + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                if pe_magic != LOONGARCH_LINUX_PE_MAGIC {
-                    return Err(StartMicrovmError::PeGzInvalid);
-                }
-
-                let kernel_entry = u64::from_le_bytes(
-                    kernel_data[LOONGARCH_KERNEL_ENTRY_OFFSET..LOONGARCH_KERNEL_ENTRY_OFFSET + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-                let load_offset = u64::from_le_bytes(
-                    kernel_data[LOONGARCH_LOAD_OFFSET_OFFSET..LOONGARCH_LOAD_OFFSET_OFFSET + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-
-                let image_load_addr = GuestAddress(
-                    arch::loongarch64::layout::DRAM_MEM_START
-                        .checked_add(load_offset)
-                        .ok_or(StartMicrovmError::PeGzInvalid)?,
-                );
-
-                let entry_offset = kernel_entry
-                    .checked_sub(LOONGARCH_VMLINUX_LOAD_ADDRESS)
-                    .ok_or(StartMicrovmError::PeGzInvalid)?;
-                let entry_addr = GuestAddress(
-                    image_load_addr
-                        .raw_value()
-                        .checked_add(entry_offset)
-                        .ok_or(StartMicrovmError::PeGzInvalid)?,
-                );
-
-                debug!(
-                    "loongarch pegz image_load_addr=0x{:x}, entry_addr=0x{:x}",
-                    image_load_addr.0,
-                    entry_addr.0
-                );
-
-                guest_mem
-                    .write(&kernel_data, image_load_addr)
-                    .map_err(|_| {
-                        StartMicrovmError::KernelDoesNotFit(
-                            image_load_addr.raw_value(),
-                            kernel_data.len(),
-                        )
-                    })?;
-                entry_addr
+                kernel_data
             } else {
+                debug!("No GZIP header found on PE file; treating it as plain PE image");
+                data
+            };
+
+            if kernel_data.len() < LOONGARCH_IMAGE_HEADER_SIZE {
                 return Err(StartMicrovmError::PeGzInvalid);
             }
+
+            let pe_magic = u32::from_le_bytes(
+                kernel_data[LOONGARCH_LINUX_PE_MAGIC_OFFSET..LOONGARCH_LINUX_PE_MAGIC_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if pe_magic != LOONGARCH_LINUX_PE_MAGIC {
+                return Err(StartMicrovmError::PeGzInvalid);
+            }
+
+            let kernel_entry = u64::from_le_bytes(
+                kernel_data[LOONGARCH_KERNEL_ENTRY_OFFSET..LOONGARCH_KERNEL_ENTRY_OFFSET + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let load_offset = u64::from_le_bytes(
+                kernel_data[LOONGARCH_LOAD_OFFSET_OFFSET..LOONGARCH_LOAD_OFFSET_OFFSET + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            let image_load_addr = GuestAddress(
+                arch::loongarch64::layout::DRAM_MEM_START
+                    .checked_add(load_offset)
+                    .ok_or(StartMicrovmError::PeGzInvalid)?,
+            );
+
+            let entry_offset = kernel_entry
+                .checked_sub(LOONGARCH_VMLINUX_LOAD_ADDRESS)
+                .ok_or(StartMicrovmError::PeGzInvalid)?;
+            let entry_addr = GuestAddress(
+                image_load_addr
+                    .raw_value()
+                    .checked_add(entry_offset)
+                    .ok_or(StartMicrovmError::PeGzInvalid)?,
+            );
+
+            debug!(
+                "loongarch pegz image_load_addr=0x{:x}, entry_addr=0x{:x}",
+                image_load_addr.0,
+                entry_addr.0
+            );
+
+            guest_mem
+                .write(&kernel_data, image_load_addr)
+                .map_err(|_| {
+                    StartMicrovmError::KernelDoesNotFit(
+                        image_load_addr.raw_value(),
+                        kernel_data.len(),
+                    )
+                })?;
+            entry_addr
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -1410,6 +1422,12 @@ fn load_external_kernel(
     } else {
         None
     };
+
+    debug!(
+        "external kernel initramfs_path={:?}, initrd_config_present={}",
+        external_kernel.initramfs_path,
+        initrd_config.is_some(),
+    );
 
     Ok((entry_addr, initrd_config, external_kernel.cmdline.clone()))
 }
@@ -1997,12 +2015,17 @@ fn create_vcpus_loongarch64(
     efi_system_table_addr: GuestAddress,
     exit_evt: &EventFd,
 ) -> super::Result<Vec<Vcpu>> {
+    use arch::loongarch64::linux::iocsr::LoongArchIocsrState;
+    use std::sync::Arc;
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    //let iocsr_misc_func = Arc::new(AtomicU64::new(0));
+    let iocsr_state = Arc::new(LoongArchIocsrState::new(vcpu_config.vcpu_count as usize));
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = Vcpu::new_loongarch64(
             cpu_index,
             vm.fd(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
+            iocsr_state.clone(),
         )
         .map_err(Error::Vcpu)?;
 
