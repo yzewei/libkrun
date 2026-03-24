@@ -547,6 +547,14 @@ pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32 {
+    #[cfg(all(target_os = "linux", target_arch = "loongarch64"))]
+    if num_vcpus > 1 {
+        warn!(
+            "LoongArch currently supports only a single vCPU in libkrun (requested: {num_vcpus})"
+        );
+        return -libc::EOPNOTSUPP;
+    }
+
     let mem_size_mib: usize = match ram_mib.try_into() {
         Ok(size) => size,
         Err(e) => {
@@ -1901,7 +1909,12 @@ pub extern "C" fn krun_get_max_vcpus() -> i32 {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "loongarch64"))]
+    {
+        1
+    }
+
+    #[cfg(all(target_os = "linux", not(target_arch = "loongarch64")))]
     {
         use kvm_ioctls::Kvm;
         match Kvm::new() {

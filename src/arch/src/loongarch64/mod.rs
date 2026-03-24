@@ -29,7 +29,9 @@ pub fn arch_memory_regions(
     let page_size: usize = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
     let dram_size = align_upwards!(size, page_size);
     let ram_last_addr = layout::DRAM_MEM_START + (dram_size as u64);
-    let shm_start_addr = ((ram_last_addr / 0x4000_0000) + 1) * 0x4000_0000;
+    // Align SHM start to 1GiB boundaries without forcing an extra 1GiB gap
+    // when RAM already ends at an aligned boundary.
+    let shm_start_addr = align_upwards!(ram_last_addr, 0x4000_0000u64);
 
     let fdt_addr = ram_last_addr - layout::FDT_MAX_SIZE as u64;
     let efi_system_table_addr = fdt_addr - layout::EFI_GUEST_SIZE;

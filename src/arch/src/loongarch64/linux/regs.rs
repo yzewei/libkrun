@@ -1,11 +1,19 @@
 use kvm_bindings::{KVM_REG_LOONGARCH, KVM_REG_SIZE_U64, LOONGARCH_REG_SHIFT};
 use kvm_ioctls::VcpuFd;
-use log::debug;
+use log::{debug, warn};
 use std::arch::asm;
 use std::result;
+
+const KVM_REG_LOONGARCH_CSR: u64 = (KVM_REG_LOONGARCH as u64) | 0x10000;
+const LOONGARCH_CSR_CPUID: u64 = 0x20;
+
 const KVM_REG_LOONGARCH_CPUCFG: u64 = (KVM_REG_LOONGARCH as u64) | 0x40000;
 const CPUCFG0_REG_ID: u64 =
     KVM_REG_LOONGARCH_CPUCFG | KVM_REG_SIZE_U64 | (0_u64 << LOONGARCH_REG_SHIFT);
+const CSR_CPUID_REG_ID: u64 =
+    KVM_REG_LOONGARCH_CSR | KVM_REG_SIZE_U64 | (LOONGARCH_CSR_CPUID << LOONGARCH_REG_SHIFT);
+// Keep bits [25:0] only for now. Do not expose MSGINT (bit 26) by default
+// on microVM profile because host KVM support is inconsistent.
 const CPUCFG1_KVM_MASK: u64 = (1u64 << 26) - 1;
 
 const CPUCFG2_FP: u64 = 1 << 0;
@@ -19,7 +27,7 @@ const CPUCFG2_LLFTPREV: u64 = 0x7 << 15;
 const CPUCFG2_LSPW: u64 = 1 << 21;
 const CPUCFG2_LAM: u64 = 1 << 22;
 
-const CPUCFG3_KVM_MASK: u64 = (1u64 << 17) - 1;
+const CPUCFG3_KVM_CONSERVATIVE_MASK: u64 = 0x0000_fcff;
 const CPUCFG4_KVM_MASK: u64 = 0xffff_ffff;
 const CPUCFG5_KVM_MASK: u64 = 0xffff_ffff;
 
@@ -40,6 +48,7 @@ type Result<T> = result::Result<T, Error>;
 
 pub fn setup_regs(
     vcpu: &VcpuFd,
+    cpu_id: u8,
     boot_ip: u64,
     cmdline_addr: u64,
     efi_boot: bool,
@@ -47,21 +56,56 @@ pub fn setup_regs(
 ) -> Result<()> {
     setup_cpucfg(vcpu)?;
     let mut regs = vcpu.get_regs().map_err(Error::GetCoreRegs)?;
+
+    // Secondary CPUs start from reset state and are brought up later by guest SMP code.
+    if cpu_id != 0 {
+        let cpuid = u64::from(cpu_id);
+        vcpu.set_one_reg(CSR_CPUID_REG_ID, &cpuid.to_le_bytes())
+            .map_err(Error::SetOneReg)?;
+        debug!("loongarch set csr cpuid: {} (ap-reset-state)", cpuid);
+        return Ok(());
+    }
+
     regs.pc = boot_ip;
     regs.gpr[4] = u64::from(efi_boot);
     regs.gpr[5] = cmdline_addr;
     regs.gpr[6] = system_table;
+    vcpu.set_regs(&regs).map_err(Error::SetCoreRegs)?;
+
+    // KVM starts vCPU with an invalid CPUID (KVM_MAX_PHYID). Program per-vCPU CPUID.
+    // Do this after set_regs() so it cannot be clobbered by later register writes.
+    let cpuid = 0u64;
+    vcpu.set_one_reg(CSR_CPUID_REG_ID, &cpuid.to_le_bytes())
+        .map_err(Error::SetOneReg)?;
+
+    let mut cpuid_readback = [0_u8; 8];
+    if vcpu
+        .get_one_reg(CSR_CPUID_REG_ID, &mut cpuid_readback)
+        .is_ok()
+    {
+        debug!(
+            "loongarch set csr cpuid: {}, readback={}",
+            cpuid,
+            u64::from_le_bytes(cpuid_readback)
+        );
+    } else {
+        debug!("loongarch set csr cpuid: {}", cpuid);
+    }
 
     debug!(
-        "loongarch setup_regs: pc=0x{:x}, a0={}, a1=0x{:x}, a2=0x{:x}",
-        regs.pc, regs.gpr[4], regs.gpr[5], regs.gpr[6],
+        "loongarch setup_regs: cpu_id={}, pc=0x{:x}, a0={}, a1=0x{:x}, a2=0x{:x}",
+        cpu_id,
+        regs.pc,
+        regs.gpr[4],
+        regs.gpr[5],
+        regs.gpr[6],
     );
     let mut cpucfg0 = [0_u8; 8];
     if vcpu.get_one_reg(CPUCFG0_REG_ID, &mut cpucfg0).is_ok() {
         let cpucfg0 = u64::from_le_bytes(cpucfg0);
         debug!("loongarch cpucfg0: 0x{:x}", cpucfg0);
     }
-    vcpu.set_regs(&regs).map_err(Error::SetCoreRegs)?;
+
     Ok(())
 }
 
@@ -88,30 +132,38 @@ fn filter_cpucfg_for_kvm(index: u64, host_value: u64) -> u64 {
     match index {
         0 => host_value & 0xffff_ffff,
         1 => host_value & CPUCFG1_KVM_MASK,
-        2 => {
-            let mut mask = CPUCFG2_FP
-                | CPUCFG2_FPSP
-                | CPUCFG2_FPDP
-                | CPUCFG2_FPVERS
-                | CPUCFG2_LLFTP
-                | CPUCFG2_LLFTPREV
-                | CPUCFG2_LSPW
-                | CPUCFG2_LAM;
-
-            if host_value & CPUCFG2_LSX != 0 {
-                mask |= CPUCFG2_LSX;
-            }
-            if host_value & CPUCFG2_LASX != 0 {
-                mask |= CPUCFG2_LASX;
-            }
-
-            host_value & mask
-        }
-        3 => host_value & CPUCFG3_KVM_MASK,
+        2 => filter_cpucfg2_conservative(host_value),
+        3 => filter_cpucfg3_conservative(host_value),
         4 => host_value & CPUCFG4_KVM_MASK,
         5 => host_value & CPUCFG5_KVM_MASK,
         _ => 0,
     }
+}
+
+#[inline]
+fn filter_cpucfg2_conservative(host_value: u64) -> u64 {
+    let mut mask = CPUCFG2_FP
+        | CPUCFG2_FPSP
+        | CPUCFG2_FPDP
+        | CPUCFG2_FPVERS
+        | CPUCFG2_LLFTP
+        | CPUCFG2_LLFTPREV
+        | CPUCFG2_LSPW
+        | CPUCFG2_LAM;
+
+    if host_value & CPUCFG2_LSX != 0 {
+        mask |= CPUCFG2_LSX;
+    }
+    if host_value & CPUCFG2_LASX != 0 {
+        mask |= CPUCFG2_LASX;
+    }
+
+    host_value & mask
+}
+
+#[inline]
+fn filter_cpucfg3_conservative(host_value: u64) -> u64 {
+    host_value & CPUCFG3_KVM_CONSERVATIVE_MASK
 }
 
 fn setup_cpucfg(vcpu: &VcpuFd) -> Result<()> {
@@ -119,9 +171,15 @@ fn setup_cpucfg(vcpu: &VcpuFd) -> Result<()> {
     for index in 0..=5u64 {
         let host_value = read_host_cpucfg(index);
         let guest_value = filter_cpucfg_for_kvm(index, host_value);
+        let reg_id = cpucfg_reg_id(index);
 
-        vcpu.set_one_reg(cpucfg_reg_id(index), &guest_value.to_le_bytes())
-            .map_err(Error::SetOneReg)?;
+        if let Err(e) = vcpu.set_one_reg(reg_id, &guest_value.to_le_bytes()) {
+            warn!(
+                "loongarch set cpucfg{} failed: {:?} (host=0x{:x}, guest=0x{:x})",
+                index, e, host_value, guest_value
+            );
+            return Err(Error::SetOneReg(e));
+        }
 
         debug!(
             "loongarch set cpucfg{}: host=0x{:x}, guest=0x{:x}",

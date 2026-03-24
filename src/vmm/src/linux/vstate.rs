@@ -1194,17 +1194,6 @@ impl Vcpu {
         })
     }
 
-    #[cfg(target_arch = "loongarch64")]
-    pub fn try_clone_irq_vcpu_file(&self) -> Result<File> {
-        let vcpufd = unsafe { libc::dup(self.fd.as_raw_fd()) };
-        if vcpufd < 0 {
-            return Err(Error::VcpuFdClone(io::Error::last_os_error()));
-        }
-
-        Ok(unsafe { File::from_raw_fd(vcpufd) })
-    }
-
-
     /// Returns the cpu index as seen by the guest OS.
     pub fn cpu_index(&self) -> u8 {
         self.id
@@ -1219,6 +1208,15 @@ impl Vcpu {
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn try_clone_irq_vcpu_file(&self) -> Result<File> {
+        let vcpufd = unsafe { libc::dup(self.fd.as_raw_fd()) };
+        if vcpufd < 0 {
+            return Err(Error::VcpuFdClone(io::Error::last_os_error()));
+        }
+        Ok(unsafe { File::from_raw_fd(vcpufd) })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1342,7 +1340,14 @@ impl Vcpu {
         cmdline_addr: GuestAddress,
         efi_system_table_addr: GuestAddress,
     ) -> Result<()> {
-        arch::loongarch64::regs::setup_regs(&self.fd, kernel_load_addr.raw_value(), cmdline_addr.raw_value(), true, efi_system_table_addr.raw_value())
+        arch::loongarch64::regs::setup_regs(
+            &self.fd,
+            self.id,
+            kernel_load_addr.raw_value(),
+            cmdline_addr.raw_value(),
+            true,
+            efi_system_table_addr.raw_value(),
+        )
             .map_err(Error::REGSConfiguration)?;
         Ok(())
     }
@@ -1512,7 +1517,8 @@ impl Vcpu {
         }
 
         match self.fd.run() {
-            Ok(run) => match run {
+            Ok(run) => {
+                let emulation = match run {
                 #[cfg(feature = "tee")]
                 VcpuExit::Hypercall(hypercall) => {
                     if hypercall.nr != 12
@@ -1575,16 +1581,12 @@ impl Vcpu {
                     }
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    //#[cfg(target_arch = "loongarch64")]
-                    //debug!("loongarch serial mmio read: addr=0x{addr:x}, len={}", data.len());
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.read(0, addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    //#[cfg(target_arch = "loongarch64")]
-                    //debug!("loongarch serial mmio write: addr=0x{addr:x}, data={:x?}", data);
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(0, addr, data);
                     }
@@ -1592,7 +1594,7 @@ impl Vcpu {
                 }
                 #[cfg(target_arch = "loongarch64")]
                 VcpuExit::IocsrRead(addr, data) => {
-                    match process_iocsr_read(addr, data, &self.iocsr_state.clone(), self.id) {
+                    match process_iocsr_read(addr, data, &self.iocsr_state, self.id) {
                         arch::loongarch64::linux::iocsr::IocsrReadResult::Value(value) => {
                             debug!("LoongArch IOCSR read: addr=0x{addr:x}, len={}, value=0x{value:x}", data.len());
                             Ok(VcpuEmulation::Handled)
@@ -1605,7 +1607,7 @@ impl Vcpu {
                 }
                 #[cfg(target_arch = "loongarch64")]
                 VcpuExit::IocsrWrite(addr, data) => {
-                    match process_iocsr_write(addr, data, &self.iocsr_state.clone(), self.id) {
+                    match process_iocsr_write(addr, data, &self.iocsr_state, self.id) {
                         arch::loongarch64::linux::iocsr::IocsrWriteResult::Handled => {
                             let value = u64::from_le_bytes(data.try_into().unwrap());
                             debug!("LoongArch IOCSR write: addr=0x{addr:x}, value=0x{value:x}");
@@ -1649,7 +1651,9 @@ impl Vcpu {
                     error!("Unexpected exit reason on vcpu run: {r:?}");
                     Err(Error::VcpuUnhandledKvmExit)
                 }
-            },
+                };
+                emulation
+            }
             // The unwrap on raw_os_error can only fail if we have a logic
             // error in our code in which case it is better to panic.
             Err(ref e) => {
@@ -1899,15 +1903,23 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
     use crate::builder::create_guest_memory;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
     use crate::builder::Payload;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
     use crate::resources::VmResources;
     use devices;
     #[cfg(target_arch = "x86_64")]
     use devices::legacy::KvmIoapic;
+    #[cfg(target_arch = "loongarch64")]
+    const TEST_GUEST_MEM_BASE: u64 = arch::loongarch64::layout::DRAM_MEM_START;
+    #[cfg(not(target_arch = "loongarch64"))]
+    const TEST_GUEST_MEM_BASE: u64 = 0;
+
+    fn test_page_size() -> u64 {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
 
     use utils::signal::validate_signal_num;
 
@@ -1927,10 +1939,12 @@ mod tests {
     // Auxiliary function being used throughout the tests.
     fn setup_vcpu(mem_size: usize) -> (Vm, Vcpu, GuestMemoryMmap) {
         let kvm = KvmContext::new().unwrap();
-        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(TEST_GUEST_MEM_BASE), mem_size)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("Cannot create new vm");
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(&vm.fd()).unwrap();
+        #[cfg(target_arch = "loongarch64")]
+        let loongarch_iocsr = Arc::new(LoongArchIocsrState::new(1));
         assert!(vm.memory_init(&gm, kvm.max_memslots()).is_ok());
 
         let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
@@ -1952,13 +1966,18 @@ mod tests {
         {
             vcpu = Vcpu::new_aarch64(1, vm.fd(), exit_evt).unwrap();
         }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            vcpu = Vcpu::new_loongarch64(1, vm.fd(), exit_evt, loongarch_iocsr.clone()).unwrap();
+        }
 
         (vm, vcpu, gm)
     }
 
     #[test]
     fn test_set_mmio_bus() {
-        let (_, mut vcpu, _) = setup_vcpu(0x1000);
+        let page_size = test_page_size();
+        let (_, mut vcpu, _) = setup_vcpu(page_size as usize);
         assert!(vcpu.mmio_bus.is_none());
         vcpu.set_mmio_bus(devices::Bus::new());
         assert!(vcpu.mmio_bus.is_some());
@@ -1982,16 +2001,17 @@ mod tests {
         let mut kvm_context = KvmContext::new().unwrap();
         let mut vm = Vm::new(kvm_context.fd()).expect("Cannot create new vm");
 
+        let page_size = test_page_size();
         // Create valid memory region and test that the initialization is successful.
-        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(TEST_GUEST_MEM_BASE), page_size as usize)]).unwrap();
         assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_ok());
 
         // Set the maximum number of memory slots to 1 in KvmContext to check the error
         // path of memory_init. Create 2 non-overlapping memory slots.
         kvm_context.max_memslots = 1;
         let gm = GuestMemoryMmap::from_ranges(&[
-            (GuestAddress(0x0), 0x1000),
-            (GuestAddress(0x1001), 0x2000),
+            (GuestAddress(TEST_GUEST_MEM_BASE), page_size as usize),
+            (GuestAddress(TEST_GUEST_MEM_BASE + page_size + 1), (2 * page_size) as usize),
         ])
         .unwrap();
         assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_err());
@@ -2009,19 +2029,19 @@ mod tests {
         };
 
         assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
+            .configure_x86_64(&vm_mem, GuestAddress(TEST_GUEST_MEM_BASE), &vcpu_config, true)
             .is_ok());
 
         // Test configure while using the T2 template.
         vcpu_config.cpu_template = Some(CpuFeaturesTemplate::T2);
         assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
+            .configure_x86_64(&vm_mem, GuestAddress(TEST_GUEST_MEM_BASE), &vcpu_config, true)
             .is_ok());
 
         // Test configure while using the C3 template.
         vcpu_config.cpu_template = Some(CpuFeaturesTemplate::C3);
         assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
+            .configure_x86_64(&vm_mem, GuestAddress(TEST_GUEST_MEM_BASE), &vcpu_config, true)
             .is_ok());
     }
 
@@ -2044,7 +2064,7 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(TEST_GUEST_MEM_BASE))
             .is_ok());
 
         // Try it for when vcpu id is NOT 0.
@@ -2056,13 +2076,48 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(TEST_GUEST_MEM_BASE))
             .is_ok());
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    #[test]
+    fn test_configure_vcpu() {
+        let kvm = KvmContext::new().unwrap();
+        let vm_resources = VmResources::default();
+        let (guest_memory, arch_memory_info, _shm_manager, _) =
+            create_guest_memory(128, &vm_resources, &Payload::Empty).unwrap();
+        let cmdline_addr = GuestAddress(
+            arch_memory_info.efi_system_table_addr - arch::loongarch64::layout::CMDLINE_GUEST_SIZE,
+        );
+        let efi_system_table_addr = GuestAddress(arch_memory_info.efi_system_table_addr);
+        let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
+        assert!(vm.memory_init(&guest_memory, kvm.max_memslots()).is_ok());
+
+        // Try it for when vcpu id is 0.
+        let mut vcpu = Vcpu::new_loongarch64(
+            0,
+            vm.fd(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(LoongArchIocsrState::new(1)),
+        )
+        .unwrap();
+
+        assert!(
+            vcpu.configure_loongarch64(
+                vm.fd(),
+                GuestAddress(arch::RESET_VECTOR),
+                cmdline_addr,
+                efi_system_table_addr
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_vcpu_tls() {
-        let (_, mut vcpu, _) = setup_vcpu(0x1000);
+        let page_size = test_page_size();
+        let (_, mut vcpu, _) = setup_vcpu(page_size as usize);
 
         // Running on the TLS vcpu should fail before we actually initialize it.
         unsafe {
@@ -2093,7 +2148,8 @@ mod tests {
 
     #[test]
     fn test_invalid_tls() {
-        let (_, mut vcpu, _) = setup_vcpu(0x1000);
+        let page_size = test_page_size();
+        let (_, mut vcpu, _) = setup_vcpu(page_size as usize);
         // Initialize vcpu TLS.
         vcpu.init_thread_local_data().unwrap();
         // Trying to initialize non-empty TLS should error.
@@ -2103,7 +2159,8 @@ mod tests {
     #[test]
     fn test_vcpu_kick() {
         Vcpu::register_kick_signal_handler();
-        let (vm, mut vcpu, _mem) = setup_vcpu(0x1000);
+        let page_size = test_page_size();
+        let (vm, mut vcpu, _mem) = setup_vcpu(page_size as usize);
 
         let mut kvm_run =
             KvmRunWrapper::mmap_from_fd(&vcpu.fd, vm.fd.run_size()).expect("cannot mmap kvm-run");

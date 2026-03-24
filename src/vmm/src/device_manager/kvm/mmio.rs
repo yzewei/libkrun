@@ -353,9 +353,16 @@ mod tests {
     use std::sync::Arc;
     use utils::errno;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+    #[cfg(target_arch = "loongarch64")]
+    const TEST_GUEST_MEM_BASE: u64 = arch::loongarch64::layout::DRAM_MEM_START;
+    #[cfg(not(target_arch = "loongarch64"))]
+    const TEST_GUEST_MEM_BASE: u64 = 0;
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
 
+    fn test_page_size() -> u64 {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
     impl MMIODeviceManager {
         fn register_virtio_device(
             &mut self,
@@ -437,10 +444,11 @@ mod tests {
 
     #[test]
     fn test_register_virtio_device() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
+        let page_size = test_page_size();
+        let start_addr1 = GuestAddress(TEST_GUEST_MEM_BASE);
+        let start_addr2 = GuestAddress(TEST_GUEST_MEM_BASE + page_size);
         let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+            GuestMemoryMmap::from_ranges(&[(start_addr1, page_size as usize), (start_addr2, page_size as usize)]).unwrap();
         let vm = builder::setup_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
@@ -449,7 +457,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
 
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        let mut cmdline = kernel_cmdline::Cmdline::new(page_size as usize);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         assert!(device_manager
@@ -459,10 +467,11 @@ mod tests {
 
     #[test]
     fn test_register_too_many_devices() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
+        let page_size = test_page_size();
+        let start_addr1 = GuestAddress(TEST_GUEST_MEM_BASE);
+        let start_addr2 = GuestAddress(TEST_GUEST_MEM_BASE + page_size);
         let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+            GuestMemoryMmap::from_ranges(&[(start_addr1, page_size as usize), (start_addr2, page_size as usize)]).unwrap();
         let vm = builder::setup_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
@@ -471,7 +480,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
 
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        let mut cmdline = kernel_cmdline::Cmdline::new(page_size as usize);
 
         for _i in arch::IRQ_BASE..=arch::IRQ_MAX {
             device_manager
@@ -512,9 +521,10 @@ mod tests {
 
     #[test]
     fn test_error_messages() {
+        let page_size = test_page_size();
         let device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        let mut cmdline = kernel_cmdline::Cmdline::new(page_size as usize);
         let e = Error::Cmdline(
             cmdline
                 .insert(
@@ -562,14 +572,15 @@ mod tests {
 
     #[test]
     fn test_device_info() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
+        let page_size = test_page_size();
+        let start_addr1 = GuestAddress(TEST_GUEST_MEM_BASE);
+        let start_addr2 = GuestAddress(TEST_GUEST_MEM_BASE + page_size);
         let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+            GuestMemoryMmap::from_ranges(&[(start_addr1, page_size as usize), (start_addr2, page_size as usize)]).unwrap();
         let vm = builder::setup_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        let mut cmdline = kernel_cmdline::Cmdline::new(page_size as usize);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         let type_id = 0;

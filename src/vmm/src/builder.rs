@@ -16,6 +16,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use super::{Error, Vmm};
@@ -127,7 +129,7 @@ pub enum StartMicrovmError {
     /// Cannot read firmware contents from file.
     FirmwareRead(io::Error),
     /// Memory regions are overlapping or mmap fails.
-    GuestMemoryMmap(String),
+    GuestMemoryMmap(vm_memory::Error),
     /// The BZIP2 decoder couldn't decompress the kernel.
     ImageBz2Decoder(io::Error),
     /// Cannot find compressed kernel in file.
@@ -1011,6 +1013,9 @@ pub fn build_microvm(
 
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    // Exit is requested explicitly via ioctl, separate from exit code reporting.
+    let exit_request = Arc::new(AtomicBool::new(false));
 
     let mut vmm = Vmm {
         guest_memory,
@@ -1093,6 +1098,13 @@ pub fn build_microvm(
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    let fs_exit_evt = vmm
+        .exit_evt
+        .try_clone()
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1101,6 +1113,8 @@ pub fn build_microvm(
         export_table,
         intc.clone(),
         exit_code,
+        exit_request,
+        fs_exit_evt,
         #[cfg(target_os = "macos")]
         _sender,
     )?;
@@ -1302,15 +1316,25 @@ fn load_external_kernel(
                     .ok_or(StartMicrovmError::PeGzInvalid)?,
             );
 
-            let entry_offset = kernel_entry
+            let entry_addr = if kernel_entry >= LOONGARCH_VMLINUX_LOAD_ADDRESS {
+                let entry_offset = kernel_entry
                 .checked_sub(LOONGARCH_VMLINUX_LOAD_ADDRESS)
                 .ok_or(StartMicrovmError::PeGzInvalid)?;
-            let entry_addr = GuestAddress(
-                image_load_addr
-                    .raw_value()
-                    .checked_add(entry_offset)
-                    .ok_or(StartMicrovmError::PeGzInvalid)?,
-            );
+                GuestAddress(
+                    image_load_addr
+                        .raw_value()
+                        .checked_add(entry_offset)
+                        .ok_or(StartMicrovmError::PeGzInvalid)?,
+                )
+            } else if kernel_entry >= load_offset {
+                GuestAddress(
+                    arch::loongarch64::layout::DRAM_MEM_START
+                        .checked_add(kernel_entry)
+                        .ok_or(StartMicrovmError::PeGzInvalid)?,
+                )
+            } else {
+                return Err(StartMicrovmError::PeGzInvalid);
+            };
 
             debug!(
                 "loongarch pegz image_load_addr=0x{:x}, entry_addr=0x{:x}",
@@ -1497,13 +1521,9 @@ fn load_payload(
                 guest_mem
                     .insert_region(Arc::new(
                         GuestRegionMmap::new(kernel_region, GuestAddress(kernel_guest_addr))
-                            .ok_or_else(|| {
-                                StartMicrovmError::GuestMemoryMmap(
-                                    "Failed to create GuestRegionMmap".to_string(),
-                                )
-                            })?,
+                            .map_err(StartMicrovmError::GuestMemoryMmap)?,
                     ))
-                    .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?,
+                    .map_err(StartMicrovmError::GuestMemoryMmap)?,
                 GuestAddress(kernel_entry_addr),
                 None,
                 None,
@@ -1662,7 +1682,7 @@ pub fn create_guest_memory(
     arch_mem_regions.extend(shm_manager.regions());
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        .map_err(StartMicrovmError::GuestMemoryMmap)?;
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -2031,7 +2051,6 @@ fn create_vcpus_loongarch64(
 
         vcpu.configure_loongarch64(vm.fd(), entry_addr, cmdline_addr, efi_system_table_addr)
             .map_err(Error::Vcpu)?;
-
         vcpus.push(vcpu);
     }
     Ok(vcpus)
@@ -2073,17 +2092,20 @@ fn attach_fs_devices(
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
+    exit_request: Arc<AtomicBool>,
+    exit_evt: EventFd,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
-
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
             devices::virtio::Fs::new(
                 config.fs_id.clone(),
                 config.shared_dir.clone(),
                 exit_code.clone(),
+                exit_request.clone(),
                 config.allow_root_dir_delete,
+                exit_evt.try_clone().map_err(Error::EventFd).map_err(Internal)?,
             )
             .unwrap(),
         ));

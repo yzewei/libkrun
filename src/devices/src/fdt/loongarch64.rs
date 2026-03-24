@@ -205,7 +205,7 @@ fn create_cpuintc_node(fdt: &mut FdtWriter) -> Result<()> {
 fn create_eiointc_node(fdt: &mut FdtWriter) -> Result<()> {
     // Keep the external IRQ fabric in the DT for compatibility, even though
     // the current serial/virtio path wires devices directly to cpuintc.
-    let reg = [0x0_u64, 0x1fe0_1600_u64, 0x0_u64, 0xea00_u64];
+    let reg = [0x1fe0_1600_u64, 0xea00_u64];
 
     let node = fdt.begin_node("interrupt-controller@1fe01600")?;
     fdt.property_string("compatible", "loongson,ls2k2000-eiointc")?;
@@ -220,7 +220,7 @@ fn create_eiointc_node(fdt: &mut FdtWriter) -> Result<()> {
 }
 fn create_pic_node(fdt: &mut FdtWriter, intc: &IrqChip) -> Result<()> {
     let intc = intc.lock().unwrap();
-    let reg = [0x0_u64, intc.get_mmio_addr(), 0x0_u64, intc.get_mmio_size()];
+    let reg = [intc.get_mmio_addr(), intc.get_mmio_size()];
 
     let node = fdt.begin_node(&format!("interrupt-controller@{:x}", intc.get_mmio_addr()))?;
     fdt.property_string("compatible", "loongson,pch-pic-1.0")?;
