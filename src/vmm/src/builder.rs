@@ -15,6 +15,8 @@ use std::io::{self, IsTerminal, Read};
 use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
@@ -200,7 +202,7 @@ pub enum StartMicrovmError {
     RegisterConsoleDevice(device_manager::mmio::Error),
     /// Cannot register SIGWINCH event file descriptor.
     #[cfg(target_os = "linux")]
-    RegisterFsSigwinch(kvm_ioctls::Error),
+    RegisterFsSigwinch(utils::errno::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
@@ -959,12 +961,16 @@ pub fn build_microvm(
     }
 
     #[cfg(all(target_arch = "loongarch64", target_os = "linux"))]
-    {
-        let cmdline_addr = if let Some(initrd) = &payload_config.initrd_config {
+    let cmdline_addr = {
+        if let Some(initrd) = &payload_config.initrd_config {
             initrd.address.raw_value() - arch::loongarch64::layout::CMDLINE_GUEST_SIZE
         } else {
             arch_memory_info.efi_system_table_addr - arch::loongarch64::layout::CMDLINE_GUEST_SIZE
-        };
+        }
+    };
+
+    #[cfg(all(target_arch = "loongarch64", target_os = "linux"))]
+    {
         let cmdline_addr = GuestAddress(cmdline_addr);
 
         vcpus = create_vcpus_loongarch64(
@@ -1019,6 +1025,10 @@ pub fn build_microvm(
 
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    // Exit is requested explicitly via ioctl, separate from exit code reporting.
+    let exit_request = Arc::new(AtomicBool::new(false));
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -1100,6 +1110,13 @@ pub fn build_microvm(
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    let fs_exit_evt = vmm
+        .exit_evt
+        .try_clone()
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1108,6 +1125,8 @@ pub fn build_microvm(
         export_table,
         intc.clone(),
         exit_code,
+        exit_request,
+        fs_exit_evt,
         #[cfg(target_os = "macos")]
         _sender,
     )?;
@@ -1136,8 +1155,8 @@ pub fn build_microvm(
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
 
-    // Write the kernel command line to guest memory. This is x86_64 specific, since on
-    // aarch64 the command line will be specified through the FDT.
+    // For x86_64, kernel command line is loaded here.
+    // For aarch64, it's specified through the FDT.
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
@@ -1519,11 +1538,7 @@ fn load_payload(
                 guest_mem
                     .insert_region(Arc::new(
                         GuestRegionMmap::new(kernel_region, GuestAddress(kernel_guest_addr))
-                            .ok_or_else(|| {
-                                StartMicrovmError::GuestMemoryMmap(
-                                    "Failed to create GuestRegionMmap".to_string(),
-                                )
-                            })?,
+                            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?,
                     ))
                     .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?,
                 GuestAddress(kernel_entry_addr),
@@ -2102,6 +2117,8 @@ fn attach_fs_devices(
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
+    exit_request: Arc<AtomicBool>,
+    exit_evt: EventFd,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
@@ -2111,7 +2128,12 @@ fn attach_fs_devices(
                 config.fs_id.clone(),
                 config.shared_dir.clone(),
                 exit_code.clone(),
+                exit_request.clone(),
                 config.allow_root_dir_delete,
+                exit_evt
+                    .try_clone()
+                    .map_err(Error::EventFd)
+                    .map_err(Internal)?,
             )
             .unwrap(),
         ));

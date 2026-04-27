@@ -345,6 +345,8 @@ impl HvfVcpu<'_> {
         let cntfrq = 0u64;
         #[cfg(target_arch = "riscv64")]
         let cntfrq = 0u64;
+        #[cfg(target_arch = "loongarch64")]
+        let cntfrq = 0u64;
 
         let ret = unsafe {
             hv_vcpu_create(

@@ -32,6 +32,7 @@
 
 #define KRUN_EXIT_CODE_IOCTL 0x7602
 #define KRUN_REMOVE_ROOT_DIR_IOCTL 0x7603
+#define KRUN_EXIT_VM_IOCTL 0x7604
 
 #define KRUN_MAGIC "KRUN"
 #define KRUN_FOOTER_LEN 12
@@ -1024,6 +1025,35 @@ void set_exit_code(int code)
     close(fd);
 }
 
+void request_vm_exit(void)
+{
+    int fd;
+    int ret;
+    int virtiofs_check;
+
+    virtiofs_check = is_virtiofs("/");
+    if (virtiofs_check < 0) {
+        printf("Warning: Could not determine filesystem type for root\n");
+    }
+
+    if (virtiofs_check == 0) {
+        return;
+    }
+
+    fd = open("/", O_RDONLY);
+    if (fd < 0) {
+        perror("Couldn't open root filesystem to request VM exit");
+        return;
+    }
+
+    ret = ioctl(fd, KRUN_EXIT_VM_IOCTL, 0);
+    if (ret < 0) {
+        perror("Error using the ioctl to request VM exit");
+    }
+
+    close(fd);
+}
+
 int try_mount(const char *source, const char *target, const char *fstype,
               unsigned long mountflags, const void *data)
 {
@@ -1057,6 +1087,23 @@ int try_mount(const char *source, const char *target, const char *fstype,
     fclose(f);
 
     return mount_status;
+}
+
+static void shutdown_vm(void)
+{
+    /*
+     * Give virtio-console a short window to flush trailing guest output
+     * (e.g. final "OK\n") before forcing VM termination via ioctl.
+     */
+    fflush(NULL);
+    usleep(300 * 1000);
+    sync();
+    request_vm_exit();
+    /*
+     * Keep PID 1 alive briefly after issuing the exit request so userspace
+     * has a chance to process pending console traffic before teardown.
+     */
+    usleep(200 * 1000);
 }
 
 int main(int argc, char **argv)
@@ -1258,9 +1305,15 @@ int main(int argc, char **argv)
     } else { // parent
         // Wait until the workload's entrypoint has exited, ignoring any other
         // children.
-        while (waitpid(-1, &status, 0) != child) {
-            // Not the first child, ignore it.
-        };
+        while (waitpid(child, &status, 0) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("waitpid");
+            set_exit_code(125);
+            shutdown_vm();
+            _exit(125);
+        }
 
         // The workload's entrypoint has exited, record its exit code and exit
         // ourselves.
@@ -1269,6 +1322,9 @@ int main(int argc, char **argv)
         } else if (WIFSIGNALED(status)) {
             set_exit_code(WTERMSIG(status) + 128);
         }
+        shutdown_vm();
+        // If the VM exit request wasn't honored, force init exit.
+        _exit(0);
     }
 
     return 0;

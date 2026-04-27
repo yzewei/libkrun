@@ -9,3 +9,10 @@ resolver = "2"
 [profile.release]
 #panic = "abort"
 lto = true
+
+[patch.crates-io]
+kvm-bindings = { git = "https://github.com/yzewei/kvm.git", rev = "27d10602ed85de351e9cd6261518f9e9e7a97744" }
+kvm-ioctls = { git = "https://github.com/yzewei/kvm.git", rev = "27d10602ed85de351e9cd6261518f9e9e7a97744" }
+#kvm-bindings = { path = "/home/yzw/python-trans/kvm/kvm-bindings" }
+#kvm-ioctls = { path = "/home/yzw/python-trans/kvm/kvm-ioctls" }
+nix = { git = "https://github.com/yzewei/nix.git", branch = "loongarch64-nix-0.26.4" }

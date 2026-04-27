@@ -20,6 +20,13 @@ mod host {
                 krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, self.num_cpus, self.ram_mib))?;
+                // 把 ttyS0 输出接到宿主 stderr，便于看内核日志
+                 krun_call!(krun_add_serial_console_default(
+                     ctx,
+                     -1,
+                     nix::libc::STDERR_FILENO,
+                 ))?;
+                 krun_call!(krun_set_kernel_console(ctx, c"ttyS0,115200".as_ptr()))?;
                 setup_fs_and_enter(ctx, test_setup)?;
             }
             Ok(())

@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use utils::worker_message::WorkerMessage;
 
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -28,6 +28,8 @@ pub struct FsWorker {
     server: Server<PassthroughFs>,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
+    exit_request: Arc<AtomicBool>,
+    exit_evt: EventFd,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
 }
@@ -43,6 +45,8 @@ impl FsWorker {
         passthrough_cfg: passthrough::Config,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
+        exit_request: Arc<AtomicBool>,
+        exit_evt: EventFd,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Self {
         Self {
@@ -54,6 +58,8 @@ impl FsWorker {
             server: Server::new(PassthroughFs::new(passthrough_cfg).unwrap()),
             stop_fd,
             exit_code,
+            exit_request,
+            exit_evt,
             #[cfg(target_os = "macos")]
             map_sender,
         }
@@ -124,7 +130,7 @@ impl FsWorker {
     }
 
     fn handle_event(&mut self, queue_index: usize) {
-        debug!("Fs: queue event: {queue_index}");
+        // debug!("Fs: queue event: {queue_index}");
         if let Err(e) = self.queue_evts[queue_index].read() {
             error!("Failed to get queue event: {e:?}");
         }
@@ -155,16 +161,34 @@ impl FsWorker {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
+            let _written = match self.server.handle_message(
                 reader,
                 writer,
                 &self.shm_region,
                 &self.exit_code,
+                &self.exit_request,
                 #[cfg(target_os = "macos")]
                 &self.map_sender,
             ) {
-                error!("error handling message: {e:?}");
-            }
+                Ok(n) => {
+                    // debug!("virtiofs reply bytes_written={}", n);
+                    n as u32
+                }
+                Err(e) => {
+                    error!("error handling message: {e:?}");
+                    0
+                }
+            };
+            // if let Err(e) = self.server.handle_message(
+            //     reader,
+            //     writer,
+            //     &self.shm_region,
+            //     &self.exit_code,
+            //     #[cfg(target_os = "macos")]
+            //     &self.map_sender,
+            // ) {
+            //     error!("error handling message: {e:?}");
+            // }
 
             if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
                 error!("failed to add used elements to the queue: {e:?}");
@@ -172,6 +196,14 @@ impl FsWorker {
 
             if queue.needs_notification(&self.mem).unwrap() {
                 self.interrupt.signal_used_queue();
+            }
+
+            if self.exit_request.swap(false, Ordering::SeqCst) {
+                debug!("virtiofs explicit exit request received; signaling VMM exit event");
+                if let Err(e) = self.exit_evt.write(1) {
+                    error!("failed to signal VMM exit event: {e}");
+                }
+                return;
             }
         }
     }
