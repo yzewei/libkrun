@@ -1708,6 +1708,32 @@ pub fn create_guest_memory(
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // Setup boot code for secondary CPUs to reponse ipi
+        let boot_addr = GuestAddress(arch::loongarch64::layout::RESET_VECTOR);
+        let boot_code :[u32; 54] = [
+        0x0400302c, 0x0380100c, 0x04000180, 0x03400000,
+        0x0400800c, 0x034ffd8c, 0x0015000d, 0x5800718d,
+        0x1400002d, 0x038081ad, 0x06481da0, 0x1400002c,
+        0x0400118c, 0x02fffc0c, 0x1400002d, 0x038011ad,
+        0x064819ac, 0x1400002d, 0x038081ad, 0x06488000,
+        0x03400000, 0x064809ac, 0x43fff59f, 0x1400002d,
+        0x064809ac, 0x1400002d, 0x038031ad, 0x064819ac,
+        0x1400002c, 0x04001180, 0x1400002d, 0x038081ad,
+        0x06480dac, 0x00150181, 0x4c000020, 0x03400000,
+        0x1800000d, 0x28c0a1a4, 0x1800000d, 0x28c0a1a5,
+        0x1800000d, 0x28c0a1a6, 0x1800000d, 0x28c0a1ac,
+        0x00150181, 0x4c000020, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000];
+        let bc_ptr = boot_code.as_ptr() as *const u8;
+        let bc_len = boot_code.len() * std::mem::size_of::<u32>();
+        let bc_byte =
+            unsafe { std::slice::from_raw_parts(bc_ptr as *mut u8, bc_len) };
+        guest_mem.write(bc_byte, boot_addr).unwrap();
+    }
+
     // Only write firmware if data exists AND this isn't an ExternalKernel payload
     // (ExternalKernel does direct kernel boot and doesn't use EFI firmware)
     if !matches!(payload, Payload::ExternalKernel(_)) {
