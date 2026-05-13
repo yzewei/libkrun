@@ -1,5 +1,5 @@
 /// Start of RAM on LoongArch.
-pub const DRAM_MEM_START: u64 = 0x4000_0000; // 1GB
+pub const DRAM_MEM_START: u64 = 0x1000_0000; // 1GB
 
 /// The maximum addressable RAM address.
 pub const DRAM_MEM_END: u64 = 0x00FF_8000_0000; // 1022GB
@@ -24,7 +24,7 @@ pub const IRQ_MAX: u32 = 9;
 pub const MAPPED_IO_START: u64 = 0x0a00_0000;
 
 /// Where the PC register will point after reset.
-pub const RESET_VECTOR: u64 = 0;
+pub const RESET_VECTOR: u64 = 0x1C00_0000;
 
 /// The address to load firmware, if present.
 pub const FIRMWARE_START: u64 = 0;

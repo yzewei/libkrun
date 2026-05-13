@@ -3,6 +3,7 @@ use kvm_ioctls::VcpuFd;
 use log::{debug, warn};
 use std::arch::asm;
 use std::result;
+use crate::loongarch64::layout;
 
 const KVM_REG_LOONGARCH_CSR: u64 = (KVM_REG_LOONGARCH as u64) | 0x10000;
 const LOONGARCH_CSR_CPUID: u64 = 0x20;
@@ -63,6 +64,9 @@ pub fn setup_regs(
 
     // Secondary CPUs start from reset state and are brought up later by guest SMP code.
     if cpu_id != 0 {
+        regs.pc = layout::RESET_VECTOR;
+        vcpu.set_regs(&regs).map_err(Error::SetCoreRegs)?;
+
         let cpuid = u64::from(cpu_id);
         vcpu.set_one_reg(CSR_CPUID_REG_ID, &cpuid.to_le_bytes())
             .map_err(Error::SetOneReg)?;
