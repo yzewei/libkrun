@@ -27,6 +27,9 @@ const CPUCFG2_LSX: u64 = 1 << 6;
 const CPUCFG2_LASX: u64 = 1 << 7;
 const CPUCFG2_LLFTP: u64 = 1 << 14;
 const CPUCFG2_LLFTPREV: u64 = 0x7 << 15;
+const CPUCFG2_LBT_X86: u64 = 1 << 18;
+const CPUCFG2_LBT_ARM: u64 = 1 << 19;
+const CPUCFG2_LBT_MIPS: u64 = 1 << 20;
 const CPUCFG2_X86BT: u64 = 1 << 18;
 const CPUCFG2_LSPW: u64 = 1 << 21;
 const CPUCFG2_LAM: u64 = 1 << 22;
@@ -167,6 +170,15 @@ fn filter_cpucfg2_conservative(host_value: u64) -> u64 {
     }
     if host_value & CPUCFG2_X86BT != 0 {
         mask |= CPUCFG2_X86BT;
+    }
+    if host_value & CPUCFG2_LBT_X86 != 0 {
+        mask |= CPUCFG2_LBT_X86;
+    }
+    if host_value & CPUCFG2_LBT_ARM != 0 {
+        mask |= CPUCFG2_LBT_ARM;
+    }
+    if host_value & CPUCFG2_LBT_MIPS != 0 {
+        mask |= CPUCFG2_LBT_MIPS;
     }
 
     host_value & mask
